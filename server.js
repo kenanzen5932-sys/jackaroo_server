@@ -51,34 +51,7 @@ const roomState = {
   captain: '1001',
   actorId: '1001',
   timeout: 30,
-  players: [
-    {
-      uid: '1001',
-      appId: 'gfs',
-      userId: '1001',
-      name: 'Burak (Kaptan)',
-      avatar: '',
-      gender: '1',
-      seatIndex: 0,
-      state: 1, // Ready (Kaptan hazır)
-      handCards: getRandomHand(),
-      numOfHandCards: 4,
-      pieces: [0, 0, 0, 0]
-    },
-    {
-      uid: '1002',
-      appId: 'gfs',
-      userId: '1002',
-      name: 'Telefon (Sen)',
-      avatar: '',
-      gender: '2',
-      seatIndex: 1,
-      state: 0, // Idle (Telefon 'Hazır' butonuna basabilsin!)
-      handCards: getRandomHand(),
-      numOfHandCards: 4,
-      pieces: [0, 0, 0, 0]
-    }
-  ],
+  players: [],
   modeInfos: [
     {
       mode: 1,
@@ -153,7 +126,8 @@ const server = http.createServer((req, res) => {
   // API: Invite Bot / Friend
   if (pathname === '/api/invite_bot') {
     const friendId = parsedUrl.searchParams.get('id') || ('bot_' + Date.now());
-    const friendName = parsedUrl.searchParams.get('name') || 'Misafir';
+    const friendName = decodeURIComponent(parsedUrl.searchParams.get('name') || 'Misafir');
+    const friendAvatar = decodeURIComponent(parsedUrl.searchParams.get('avatar') || '');
 
     const maxSeats = 4;
     const occupiedSeats = new Set(roomState.players.map(p => p.seatIndex));
@@ -171,7 +145,7 @@ const server = http.createServer((req, res) => {
         appId: 'gfs',
         userId: friendId,
         name: friendName,
-        avatar: '',
+        avatar: friendAvatar,
         gender: '1',
         seatIndex: freeSeat,
         state: 1, // Ready
@@ -633,9 +607,11 @@ function startGameSequence() {
 wss.on('connection', (ws, req) => {
   const urlParams = new URLSearchParams(req.url.split('?')[1] || '');
   const clientUid = urlParams.get('uid') || '1001';
-  console.log(`[WS] Client connected: UID=${clientUid}`);
+  const clientName = decodeURIComponent(urlParams.get('name') || 'Oyuncu');
+  const clientAvatar = decodeURIComponent(urlParams.get('avatar') || '');
+  console.log(`[WS] Client connected: UID=${clientUid}, Name=${clientName}, Avatar=${clientAvatar ? 'yes' : 'no'}`);
 
-  connectedClients.set(clientUid, { ws, uid: clientUid });
+  connectedClients.set(clientUid, { ws, uid: clientUid, name: clientName, avatar: clientAvatar });
 
   ws.on('message', (data) => {
     try {
@@ -657,7 +633,30 @@ wss.on('connection', (ws, req) => {
       } else if (cmdId === 2601) {
         // Login (cmd 2601) -> Reply
         ws.send(buildPacket(1, sn, 2601, Buffer.from([0x08, 0x00])));
-        console.log(`[WS] Sent LoginReply to UID: ${clientUid}`);
+        console.log(`[WS] Sent LoginReply to UID: ${clientUid} (${clientName})`);
+
+        // If in Lobby, seat this connecting user as Captain at Seat 0!
+        if (roomState.state === 0) {
+          roomState.captain = clientUid;
+          roomState.actorId = clientUid;
+
+          const captainPlayer = {
+            uid: clientUid,
+            appId: 'gfs',
+            userId: clientUid,
+            name: clientName,
+            avatar: clientAvatar,
+            gender: '1',
+            seatIndex: 0,
+            state: 1, // Ready (Captain ready)
+            handCards: getRandomHand(),
+            numOfHandCards: 4,
+            pieces: [0, 0, 0, 0]
+          };
+
+          // Room contains ONLY this player at Seat 0; seats 1, 2, 3 are empty!
+          roomState.players = [ captainPlayer ];
+        }
 
         // Send OnPlayerLogin (cmd 2602)
         setTimeout(() => {
@@ -666,9 +665,9 @@ wss.on('connection', (ws, req) => {
               uid: clientUid,
               appId: 'gfs',
               userId: clientUid,
-              name: clientUid === '1001' ? 'Burak (Kaptan)' : 'Telefon',
-              avatar: '',
-              gender: clientUid === '1001' ? '1' : '2'
+              name: clientName,
+              avatar: clientAvatar,
+              gender: '1'
             },
             game: roomState,
             serverTime: Date.now()
@@ -676,7 +675,7 @@ wss.on('connection', (ws, req) => {
 
           const encoded = gameProto.pb.OnPlayerLogin.encode(onLoginMsg).finish();
           ws.send(buildPacket(2, 0, 2602, Buffer.from(encoded)));
-          console.log(`[WS] Sent OnPlayerLogin to UID: ${clientUid} (Room State: ${roomState.state})`);
+          console.log(`[WS] Sent OnPlayerLogin to UID: ${clientUid} (${clientName}) at Seat 0. Players in room: ${roomState.players.length}`);
         }, 100);
 
       } else if (cmdId === 2607) {
