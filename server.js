@@ -368,33 +368,53 @@ const server = http.createServer((req, res) => {
     }));
   }
 
-  // API: Leave / Exit Room
-  if (pathname === '/api/leave_room') {
+  // API: Leave / Exit Room (Leaves match or lobby without disrupting other players)
+  if (pathname === '/api/leave_room' || pathname === '/api/player_exit') {
     const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
-    const uid = parsedUrl.searchParams.get('uid') || '';
+    const uid = (parsedUrl.searchParams.get('uid') || '').toString();
     const room = rooms.get(roomId);
     if (room) {
-      const idx = room.players.findIndex(p => p.uid === uid);
-      if (idx !== -1) {
-        room.players.splice(idx, 1);
-        const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
-          uid: uid,
-          kickUid: '0'
-        });
-        broadcastToRoom(roomId, 2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+      console.log(`[EXIT] Player ${uid} leaving Room ${roomId} (State: ${room.state === 2 ? 'InGame' : 'Lobby'})`);
+      if (room.state === 2) {
+        // Match in progress: Convert leaving player to AI Bot so remaining players continue smoothly!
+        const player = room.players.find(p => p.uid.toString() === uid);
+        if (player) {
+          player.isManaged = 1;
+          const onManagedMsg = lobbyProto.pb.OnPlayerSetManaged.create({
+            uid: uid,
+            isManaged: 1
+          });
+          broadcastToRoom(roomId, 2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish()));
+          console.log(`[EXIT] Player ${uid} converted to BOT in active match. Table continues for others.`);
+          if (room.actorId === uid) {
+            executeBotTurn(room, uid);
+          }
+        }
+      } else {
+        // Lobby state: Remove player from seat and notify remaining lobby players
+        const idx = room.players.findIndex(p => p.uid.toString() === uid);
+        if (idx !== -1) {
+          room.players.splice(idx, 1);
+          const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
+            uid: uid,
+            kickUid: '0'
+          });
+          broadcastToRoom(roomId, 2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+          console.log(`[EXIT] Player ${uid} removed from Lobby seat. Room remains open.`);
+        }
       }
     }
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({ success: true }));
   }
 
-  // API: Reset Lobby
+  // API: Reset Lobby (Only called when table is disbanded)
   if (pathname === '/api/reset_lobby') {
     const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
     const room = rooms.get(roomId);
     if (room) {
       if (room.turnTimer) clearTimeout(room.turnTimer);
-      room.state = 0; // Back to Lobby!
+      room.state = 0; // Back to Lobby
       room.round = 1;
       for (let p of room.players) {
         p.state = (p.uid === room.captain) ? 1 : 0;
@@ -412,13 +432,30 @@ const server = http.createServer((req, res) => {
         timestamp: Date.now()
       });
 
-      // Broadcast OnGameFinish (cmd 2613) so all connected Cocos clients revert to LobbyView
+      // Broadcast OnGameFinish (cmd 2613) with valid results array so index.js line 187 never crashes
+      const finishResults = room.players.map(p => ({
+        uid: p.uid.toString(),
+        appId: 'gfs',
+        userId: (p.userId || p.uid).toString(),
+        name: p.name || 'Oyuncu',
+        avatar: p.avatar || '',
+        gender: '1',
+        score: 0,
+        isEscaped: 0,
+        rank: (p.uid === room.captain) ? 1 : 2,
+        isAI: p.isManaged || 0,
+        isManaged: 0,
+        extras: '',
+        isWin: (p.uid === room.captain) ? 1 : 0
+      }));
+
       const finishMsg = gameProto.pb.OnGameFinish.create({
-        room: room,
-        winUid: room.captain || '1001'
+        results: finishResults,
+        reason: 'disband',
+        roundId: '1'
       });
       broadcastToRoom(roomId, 2, 0, 2613, Buffer.from(gameProto.pb.OnGameFinish.encode(finishMsg).finish()));
-      console.log(`[RESET LOBBY] Room ${roomId} reset to Lobby state (0), broadcasted OnGameFinish!`);
+      console.log(`[RESET LOBBY] Room ${roomId} reset to Lobby state (0) with valid results.`);
     }
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({ success: true, message: 'Lobi sıfırlandı' }));
@@ -831,20 +868,46 @@ wss.on('connection', (ws, req) => {
 
         // Send OnPlayerLogin (cmd 2602) containing full room state with all seated players
         setTimeout(() => {
-          const onLoginMsg = gameProto.pb.OnPlayerLogin.create({
+          const lobbyGame = {
+            players: room.players.map(p => ({
+              uid: p.uid.toString(),
+              appId: p.appId || 'gfs',
+              userId: (p.userId || p.uid).toString(),
+              name: p.name || 'Oyuncu',
+              avatar: p.avatar || '',
+              gender: p.gender || '1',
+              seatIndex: p.seatIndex,
+              state: p.state !== undefined ? p.state : 0
+            })),
+            state: room.state !== undefined ? room.state : 0,
+            captain: (room.captain || '1001').toString(),
+            modeInfos: [
+              {
+                mode: 1,
+                teamCount: [2, 4],
+                teamMemberCount: [1, 1],
+                rule: JSON.stringify({ round_time: 25, total_time: 500, settle_time: 3, win_score: 50 })
+              }
+            ],
+            mode: 1,
+            rule: room.rule || JSON.stringify({ round_time: 25, total_time: 500, settle_time: 3, win_score: 50 }),
+            setting: room.setting || '{}'
+          };
+
+          const onLoginMsg = lobbyProto.pb.OnPlayerLogin.create({
             account: {
-              uid: clientUid,
+              uid: clientUid.toString(),
               appId: 'gfs',
-              userId: clientUid,
+              userId: clientUid.toString(),
               name: clientName,
               avatar: clientAvatar,
               gender: '1'
             },
-            game: room,
+            game: lobbyGame,
             serverTime: Date.now()
           });
 
-          const encoded = gameProto.pb.OnPlayerLogin.encode(onLoginMsg).finish();
+          const encoded = lobbyProto.pb.OnPlayerLogin.encode(onLoginMsg).finish();
           ws.send(buildPacket(2, 0, 2602, Buffer.from(encoded)));
           console.log(`[WS] Sent OnPlayerLogin to UID: ${clientUid} (${clientName}) in Room ${room.id}. Total Players: ${room.players.length}`);
         }, 100);
@@ -861,10 +924,10 @@ wss.on('connection', (ws, req) => {
           console.error('[WS] Error decoding ReadyAPI:', e);
         }
         console.log(`[WS] Player ${clientUid} in Room ${currentRoom.id} set isReady to ${isReady}`);
-        const p = currentRoom.players.find(x => x.uid === clientUid);
+        const p = currentRoom.players.find(x => x.uid.toString() === clientUid.toString());
         if (p) {
           // Captain is always ready (state = 1) so Start button never flickers
-          if (currentRoom.captain === clientUid) {
+          if (currentRoom.captain.toString() === clientUid.toString()) {
             isReady = 1;
             p.state = 1;
           } else {
@@ -876,7 +939,7 @@ wss.on('connection', (ws, req) => {
 
         // Broadcast OnPlayerReady (cmd 2608) to room
         const readyMsg = lobbyProto.pb.OnPlayerReady.create({
-          uid: clientUid,
+          uid: clientUid.toString(),
           isReady: isReady
         });
         const readyEnc = lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish();
