@@ -138,9 +138,13 @@ function getOrCreateRoom(roomId, clientUid, clientName, clientAvatar) {
       room.players.push(newPlayer);
       console.log(`[ROOM JOIN] UID=${clientUid} (${clientName}) joined room ${roomId} at Seat ${freeSeat}`);
 
-      // Broadcast OnPlayerEnter & OnPlayerReady to other players in this room
+      // Broadcast OnPlayerEnter & OnPlayerReady to all players in this room
       const enterMsg = lobbyProto.pb.OnPlayerEnter.create({ player: newPlayer });
       broadcastToRoom(roomId, 2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
+
+      // Confirm both the joining player AND the captain are READY so Start button never flickers
+      const captainReadyMsg = lobbyProto.pb.OnPlayerReady.create({ uid: room.captain, isReady: 1 });
+      broadcastToRoom(roomId, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(captainReadyMsg).finish()));
 
       const readyMsg = lobbyProto.pb.OnPlayerReady.create({ uid: clientUid, isReady: 1 });
       broadcastToRoom(roomId, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
@@ -821,7 +825,15 @@ wss.on('connection', (ws, req) => {
         }
         console.log(`[WS] Player ${clientUid} in Room ${currentRoom.id} set isReady to ${isReady}`);
         const p = currentRoom.players.find(x => x.uid === clientUid);
-        if (p) p.state = isReady === 1 ? 1 : 0;
+        if (p) {
+          // Captain is always ready (state = 1) so Start button never flickers
+          if (currentRoom.captain === clientUid) {
+            isReady = 1;
+            p.state = 1;
+          } else {
+            p.state = isReady === 1 ? 1 : 0;
+          }
+        }
 
         ws.send(buildPacket(1, sn, 2607, Buffer.from([0x08, 0x00])));
 
