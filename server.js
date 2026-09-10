@@ -129,7 +129,7 @@ function getOrCreateRoom(roomId, clientUid, clientName, clientAvatar) {
         avatar: clientAvatar || '',
         gender: '1',
         seatIndex: freeSeat,
-        state: 1, // Ready by default in lobby
+        state: 0, // Joined player starts as idle (not ready) so they can toggle Hazırlan / Hazırlıktan vazgeç
         isManaged: 0,
         pieces: [0, 0, 0, 0],
         handCards: getRandomHand(),
@@ -138,16 +138,9 @@ function getOrCreateRoom(roomId, clientUid, clientName, clientAvatar) {
       room.players.push(newPlayer);
       console.log(`[ROOM JOIN] UID=${clientUid} (${clientName}) joined room ${roomId} at Seat ${freeSeat}`);
 
-      // Broadcast OnPlayerEnter & OnPlayerReady to all players in this room
+      // Broadcast OnPlayerEnter to all players in this room
       const enterMsg = lobbyProto.pb.OnPlayerEnter.create({ player: newPlayer });
       broadcastToRoom(roomId, 2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
-
-      // Confirm both the joining player AND the captain are READY so Start button never flickers
-      const captainReadyMsg = lobbyProto.pb.OnPlayerReady.create({ uid: room.captain, isReady: 1 });
-      broadcastToRoom(roomId, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(captainReadyMsg).finish()));
-
-      const readyMsg = lobbyProto.pb.OnPlayerReady.create({ uid: clientUid, isReady: 1 });
-      broadcastToRoom(roomId, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
     } else {
       console.warn(`[ROOM JOIN ERROR] Room ${roomId} is full! Could not seat UID=${clientUid}`);
     }
@@ -305,25 +298,28 @@ const server = http.createServer((req, res) => {
     const senderUid = parsedUrl.searchParams.get('senderUid') || '';
     const targetUid = parsedUrl.searchParams.get('targetUid') || 'all';
     const emojiKey = parseInt(parsedUrl.searchParams.get('emojiKey') || '1', 10);
+    const emotionId = parseInt(parsedUrl.searchParams.get('emotionId') || (99 + emojiKey).toString(), 10);
 
-    const emojiPayload = JSON.stringify({
-      type: 'emoji',
-      roomId,
-      senderUid,
-      targetUid,
-      emojiKey,
-      timestamp: Date.now()
-    });
-
-    // Broadcast to room as JSON packet
-    for (let client of connectedClients.values()) {
-      if (client.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(emojiPayload);
-      }
+    const room = rooms.get(roomId);
+    if (room) {
+      if (!room.events) room.events = [];
+      const eventObj = {
+        id: 'emoji_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+        type: 'emoji',
+        roomId,
+        senderUid,
+        targetUid,
+        emojiKey,
+        emotionId,
+        timestamp: Date.now()
+      };
+      room.events.push(eventObj);
+      if (room.events.length > 50) room.events.shift();
+      console.log(`[API] Emoji ${emojiKey} (EmotionId: ${emotionId}) from ${senderUid} to ${targetUid} in Room ${roomId}`);
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    return res.end(JSON.stringify({ success: true, emojiKey }));
+    return res.end(JSON.stringify({ success: true, emojiKey, emotionId }));
   }
 
   // API: Send Chat Message
@@ -333,24 +329,43 @@ const server = http.createServer((req, res) => {
     const senderName = decodeURIComponent(parsedUrl.searchParams.get('senderName') || 'Oyuncu');
     const text = decodeURIComponent(parsedUrl.searchParams.get('text') || '');
 
-    const chatPayload = JSON.stringify({
-      type: 'chat',
-      roomId,
-      senderUid,
-      senderName,
-      text,
-      timestamp: Date.now()
-    });
-
-    // Broadcast to room as JSON packet
-    for (let client of connectedClients.values()) {
-      if (client.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(chatPayload);
-      }
+    const room = rooms.get(roomId);
+    if (room) {
+      if (!room.events) room.events = [];
+      const eventObj = {
+        id: 'chat_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+        type: 'chat',
+        roomId,
+        senderUid,
+        senderName,
+        text,
+        timestamp: Date.now()
+      };
+      room.events.push(eventObj);
+      if (room.events.length > 50) room.events.shift();
+      console.log(`[API] Chat from ${senderName} (${senderUid}) in Room ${roomId}: "${text}"`);
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({ success: true, text }));
+  }
+
+  // API: Poll Room Events (Emojis, Chat, Reset)
+  if (pathname === '/api/poll_events') {
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const since = parseInt(parsedUrl.searchParams.get('since') || '0', 10);
+    const room = rooms.get(roomId);
+    let events = [];
+    if (room && room.events) {
+      events = room.events.filter(e => e.timestamp > since);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({
+      success: true,
+      events,
+      roomState: room ? room.state : 0,
+      serverTime: Date.now()
+    }));
   }
 
   // API: Leave / Exit Room
@@ -379,11 +394,33 @@ const server = http.createServer((req, res) => {
     const room = rooms.get(roomId);
     if (room) {
       if (room.turnTimer) clearTimeout(room.turnTimer);
-      room.state = 0;
+      room.state = 0; // Back to Lobby!
       room.round = 1;
-      room.players = room.players.filter(p => p.uid === room.captain);
+      for (let p of room.players) {
+        p.state = (p.uid === room.captain) ? 1 : 0;
+        p.pieces = [0, 0, 0, 0];
+        p.handCards = getRandomHand();
+        p.numOfHandCards = 4;
+        p.isManaged = 0;
+        p.isBanned = false;
+      }
+      if (!room.events) room.events = [];
+      room.events.push({
+        id: 'reset_' + Date.now(),
+        type: 'reset_lobby',
+        roomId,
+        timestamp: Date.now()
+      });
+
+      // Broadcast OnGameFinish (cmd 2613) so all connected Cocos clients revert to LobbyView
+      const finishMsg = gameProto.pb.OnGameFinish.create({
+        room: room,
+        winUid: room.captain || '1001'
+      });
+      broadcastToRoom(roomId, 2, 0, 2613, Buffer.from(gameProto.pb.OnGameFinish.encode(finishMsg).finish()));
+      console.log(`[RESET LOBBY] Room ${roomId} reset to Lobby state (0), broadcasted OnGameFinish!`);
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({ success: true, message: 'Lobi sıfırlandı' }));
   }
 
