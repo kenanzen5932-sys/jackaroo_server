@@ -121,6 +121,35 @@ const server = http.createServer((req, res) => {
     }, null, 2));
   }
 
+  // HTTP POST /jackaroo/login
+  if (pathname === '/jackaroo/login' || pathname.endsWith('/login')) {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      const uid = parsedUrl.searchParams.get('uid') || '1001';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        resultCode: 0,
+        uid: uid,
+        token: 'token_' + Date.now(),
+        gameModeInfo: [
+          {
+            mode: 1,
+            rule: JSON.stringify({
+              teamCount: [2, 4],
+              teamMemberCount: [1, 1],
+              round_time: 25,
+              total_time: 500,
+              settle_time: 3,
+              win_score: 50
+            })
+          }
+        ]
+      }));
+    });
+    return;
+  }
+
   // API: Invite Bot / Friend
   if (pathname === '/api/invite_bot') {
     const friendId = parsedUrl.searchParams.get('id') || ('bot_' + Date.now());
