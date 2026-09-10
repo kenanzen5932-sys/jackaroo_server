@@ -170,6 +170,23 @@ const server = http.createServer((req, res) => {
     }
   }
 
+  // API: Kick Player from Seat
+  if (pathname === '/api/kick_player' || pathname === '/api/kick_seat') {
+    const seat = parseInt(parsedUrl.searchParams.get('seatIndex') || '-1', 10);
+    const targetIdx = roomState.players.findIndex(p => p.seatIndex === seat && p.uid !== roomState.captain);
+    if (targetIdx !== -1) {
+      const kicked = roomState.players.splice(targetIdx, 1)[0];
+      const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
+        uid: kicked.uid,
+        kickUid: roomState.captain || '1001'
+      });
+      broadcastPacket(2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+      console.log(`[HTTP API] Kicked player from seat ${seat} (UID: ${kicked.uid}, Name: ${kicked.name})`);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ success: true, seat }));
+  }
+
   // API: Reset Lobby
   if (pathname === '/api/reset_lobby') {
     roomState.state = 0;
