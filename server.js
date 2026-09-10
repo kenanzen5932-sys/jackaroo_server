@@ -295,6 +295,80 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ success: true, seat }));
   }
 
+  // API: Send Emoji
+  if (pathname === '/api/send_emoji') {
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const senderUid = parsedUrl.searchParams.get('senderUid') || '';
+    const targetUid = parsedUrl.searchParams.get('targetUid') || 'all';
+    const emojiKey = parseInt(parsedUrl.searchParams.get('emojiKey') || '1', 10);
+
+    const emojiPayload = JSON.stringify({
+      type: 'emoji',
+      roomId,
+      senderUid,
+      targetUid,
+      emojiKey,
+      timestamp: Date.now()
+    });
+
+    // Broadcast to room as JSON packet
+    for (let client of connectedClients.values()) {
+      if (client.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(emojiPayload);
+      }
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ success: true, emojiKey }));
+  }
+
+  // API: Send Chat Message
+  if (pathname === '/api/send_chat') {
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const senderUid = parsedUrl.searchParams.get('senderUid') || '';
+    const senderName = decodeURIComponent(parsedUrl.searchParams.get('senderName') || 'Oyuncu');
+    const text = decodeURIComponent(parsedUrl.searchParams.get('text') || '');
+
+    const chatPayload = JSON.stringify({
+      type: 'chat',
+      roomId,
+      senderUid,
+      senderName,
+      text,
+      timestamp: Date.now()
+    });
+
+    // Broadcast to room as JSON packet
+    for (let client of connectedClients.values()) {
+      if (client.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(chatPayload);
+      }
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ success: true, text }));
+  }
+
+  // API: Leave / Exit Room
+  if (pathname === '/api/leave_room') {
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const uid = parsedUrl.searchParams.get('uid') || '';
+    const room = rooms.get(roomId);
+    if (room) {
+      const idx = room.players.findIndex(p => p.uid === uid);
+      if (idx !== -1) {
+        room.players.splice(idx, 1);
+        const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
+          uid: uid,
+          kickUid: '0'
+        });
+        broadcastToRoom(roomId, 2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ success: true }));
+  }
+
   // API: Reset Lobby
   if (pathname === '/api/reset_lobby') {
     const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
