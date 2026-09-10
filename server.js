@@ -43,29 +43,114 @@ function getRandomHand() {
   return hand;
 }
 
-// Global Room State (Lobby default: state = 0)
-const roomState = {
-  id: 'room_1',
-  mode: 1,
-  state: 0, // 0 = LobbyView, 2 = GameView
-  captain: '1001',
-  actorId: '1001',
-  timeout: 30,
-  players: [],
-  modeInfos: [
-    {
-      mode: 1,
-      teamCount: [2, 4], // Min 2, Max 4 seats in Lobby
-      teamMemberCount: [1, 1],
-      rule: JSON.stringify({ round_time: 25, total_time: 500, settle_time: 3, win_score: 50 })
-    }
-  ],
-  rule: JSON.stringify({ round_time: 25, total_time: 500, settle_time: 3, win_score: 50 }),
-  setting: '{}'
-};
+// Multi-Room Registry: Map<string, Room>
+const rooms = new Map();
 
-// Chat & Emoji event bus for players
-const roomChatEvents = [];
+// Active WebSocket Clients: Map<string, { ws, uid, name, avatar, roomId, seatIndex }>
+const connectedClients = new Map();
+
+function createNewRoom(roomId, captainUid, captainName, captainAvatar) {
+  const captainPlayer = {
+    uid: captainUid,
+    appId: 'gfs',
+    userId: captainUid,
+    name: captainName || 'Kaptan',
+    avatar: captainAvatar || '',
+    gender: '1',
+    seatIndex: 0,
+    state: 1, // Captain ready
+    isManaged: 0,
+    handCards: getRandomHand(),
+    numOfHandCards: 4,
+    pieces: [0, 0, 0, 0]
+  };
+
+  const room = {
+    id: roomId,
+    mode: 1,
+    state: 0, // 0 = LobbyView, 2 = GameView
+    captain: captainUid,
+    actorId: captainUid,
+    timeout: 30,
+    turnTimer: null,
+    players: [captainPlayer],
+    modeInfos: [
+      {
+        mode: 1,
+        teamCount: [2, 4],
+        teamMemberCount: [1, 1],
+        rule: JSON.stringify({ round_time: 25, total_time: 500, settle_time: 3, win_score: 50 })
+      }
+    ],
+    rule: JSON.stringify({ round_time: 25, total_time: 500, settle_time: 3, win_score: 50 }),
+    setting: '{}'
+  };
+
+  rooms.set(roomId, room);
+  console.log(`[ROOM CREATED] Room ${roomId} created by Captain UID=${captainUid} (${captainName})`);
+  return room;
+}
+
+function getOrCreateRoom(roomId, clientUid, clientName, clientAvatar) {
+  let room = rooms.get(roomId);
+  if (!room) {
+    return createNewRoom(roomId, clientUid, clientName, clientAvatar);
+  }
+
+  // Room exists; check if client is already inside
+  const existingPlayer = room.players.find(p => p.uid === clientUid);
+  if (existingPlayer) {
+    if (clientName) existingPlayer.name = clientName;
+    if (clientAvatar) existingPlayer.avatar = clientAvatar;
+    return room;
+  }
+
+  // Client is joining existing room in Lobby state
+  if (room.state === 0) {
+    const maxSeats = room.modeInfos && room.modeInfos[0] ? room.modeInfos[0].teamCount[1] : 4;
+    const occupiedSeats = new Set(room.players.map(p => p.seatIndex));
+    let freeSeat = -1;
+    for (let s = 1; s < maxSeats; s++) {
+      if (!occupiedSeats.has(s)) {
+        freeSeat = s;
+        break;
+      }
+    }
+    if (freeSeat === -1 && !occupiedSeats.has(0)) {
+      freeSeat = 0;
+    }
+
+    if (freeSeat !== -1) {
+      const newPlayer = {
+        uid: clientUid,
+        appId: 'gfs',
+        userId: clientUid,
+        name: clientName || `Oyuncu ${freeSeat + 1}`,
+        avatar: clientAvatar || '',
+        gender: '1',
+        seatIndex: freeSeat,
+        state: 1, // Ready by default in lobby
+        isManaged: 0,
+        pieces: [0, 0, 0, 0],
+        handCards: getRandomHand(),
+        numOfHandCards: 4
+      };
+      room.players.push(newPlayer);
+      console.log(`[ROOM JOIN] UID=${clientUid} (${clientName}) joined room ${roomId} at Seat ${freeSeat}`);
+
+      // Broadcast OnPlayerEnter & OnPlayerReady to other players in this room
+      const enterMsg = lobbyProto.pb.OnPlayerEnter.create({ player: newPlayer });
+      broadcastToRoom(roomId, 2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
+
+      const readyMsg = lobbyProto.pb.OnPlayerReady.create({ uid: clientUid, isReady: 1 });
+      broadcastToRoom(roomId, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
+    } else {
+      console.warn(`[ROOM JOIN ERROR] Room ${roomId} is full! Could not seat UID=${clientUid}`);
+    }
+  }
+
+  return room;
+}
 
 const server = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -83,14 +168,23 @@ const server = http.createServer((req, res) => {
 
   // Health check for Render.com
   if (pathname === '/' || pathname === '/health') {
+    const allRoomsData = [];
+    for (let [id, r] of rooms.entries()) {
+      allRoomsData.push({
+        id,
+        state: r.state === 0 ? 'Lobby' : 'InGame',
+        captain: r.captain,
+        players: r.players.map(p => ({ uid: p.uid, name: p.name, seat: p.seatIndex, isReady: p.state === 1 }))
+      });
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({
       status: 'online',
-      service: 'Jackaroo Online Game Server',
-      version: '1.0.0',
-      connectedPlayers: connectedClients.size,
-      roomState: roomState.state === 0 ? 'Lobby' : 'InGame',
-      players: roomState.players.map(p => ({ uid: p.uid, name: p.name, seat: p.seatIndex, isReady: p.state === 1 }))
+      service: 'Jackaroo Multi-Room Online Game Server',
+      version: '2.0.0',
+      connectedClients: connectedClients.size,
+      totalRooms: rooms.size,
+      rooms: allRoomsData
     }, null, 2));
   }
 
@@ -125,12 +219,19 @@ const server = http.createServer((req, res) => {
 
   // API: Invite Bot / Friend
   if (pathname === '/api/invite_bot') {
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const room = rooms.get(roomId);
+    if (!room) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Oda bulunamadı' }));
+    }
+
     const friendId = parsedUrl.searchParams.get('id') || ('bot_' + Date.now());
     const friendName = decodeURIComponent(parsedUrl.searchParams.get('name') || 'Misafir');
     const friendAvatar = decodeURIComponent(parsedUrl.searchParams.get('avatar') || '');
 
     const maxSeats = 4;
-    const occupiedSeats = new Set(roomState.players.map(p => p.seatIndex));
+    const occupiedSeats = new Set(room.players.map(p => p.seatIndex));
     let freeSeat = -1;
     for (let s = 1; s < maxSeats; s++) {
       if (!occupiedSeats.has(s)) {
@@ -154,13 +255,13 @@ const server = http.createServer((req, res) => {
         handCards: getRandomHand(),
         numOfHandCards: 4
       };
-      roomState.players.push(invitedPlayer);
+      room.players.push(invitedPlayer);
 
       const enterMsg = lobbyProto.pb.OnPlayerEnter.create({ player: invitedPlayer });
-      broadcastPacket(2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
+      broadcastToRoom(roomId, 2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
 
       const readyMsg = lobbyProto.pb.OnPlayerReady.create({ uid: friendId, isReady: 1 });
-      broadcastPacket(2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
+      broadcastToRoom(roomId, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ success: true, seat: freeSeat, player: invitedPlayer }));
@@ -172,16 +273,23 @@ const server = http.createServer((req, res) => {
 
   // API: Kick Player from Seat
   if (pathname === '/api/kick_player' || pathname === '/api/kick_seat') {
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const room = rooms.get(roomId);
+    if (!room) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Oda bulunamadı' }));
+    }
+
     const seat = parseInt(parsedUrl.searchParams.get('seatIndex') || '-1', 10);
-    const targetIdx = roomState.players.findIndex(p => p.seatIndex === seat && p.uid !== roomState.captain);
+    const targetIdx = room.players.findIndex(p => p.seatIndex === seat && p.uid !== room.captain);
     if (targetIdx !== -1) {
-      const kicked = roomState.players.splice(targetIdx, 1)[0];
+      const kicked = room.players.splice(targetIdx, 1)[0];
       const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
         uid: kicked.uid,
-        kickUid: roomState.captain || '1001'
+        kickUid: room.captain || '1001'
       });
-      broadcastPacket(2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
-      console.log(`[HTTP API] Kicked player from seat ${seat} (UID: ${kicked.uid}, Name: ${kicked.name})`);
+      broadcastToRoom(roomId, 2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+      console.log(`[HTTP API] Kicked player from seat ${seat} (UID: ${kicked.uid}, Name: ${kicked.name}) in Room ${roomId}`);
     }
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({ success: true, seat }));
@@ -189,41 +297,19 @@ const server = http.createServer((req, res) => {
 
   // API: Reset Lobby
   if (pathname === '/api/reset_lobby') {
-    roomState.state = 0;
-    roomState.round = 1;
-    roomState.players = [
-      {
-        uid: '1001',
-        appId: 'gfs',
-        userId: '1001',
-        name: 'Burak (Kaptan)',
-        avatar: '',
-        gender: '1',
-        seatIndex: 0,
-        state: 1,
-        handCards: getRandomHand(),
-        numOfHandCards: 4,
-        pieces: [0, 0, 0, 0]
-      },
-      {
-        uid: '1002',
-        appId: 'gfs',
-        userId: '1002',
-        name: 'Misafir',
-        avatar: '',
-        gender: '1',
-        seatIndex: 1,
-        state: 0,
-        handCards: getRandomHand(),
-        numOfHandCards: 4,
-        pieces: [0, 0, 0, 0]
-      }
-    ];
+    const roomId = parsedUrl.searchParams.get('roomId') || 'room_1';
+    const room = rooms.get(roomId);
+    if (room) {
+      if (room.turnTimer) clearTimeout(room.turnTimer);
+      room.state = 0;
+      room.round = 1;
+      room.players = room.players.filter(p => p.uid === room.captain);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: true, message: 'Lobi sıfırlandı' }));
   }
 
-  // Optional: Serve static files if local ROOT or ./public exists
+  // Optional: Serve static files
   const publicDir = fs.existsSync(path.join(__dirname, 'public')) ? path.join(__dirname, 'public') : ROOT;
   if (fs.existsSync(publicDir)) {
     let filePath = path.join(publicDir, pathname === '/' ? 'index.html' : pathname);
@@ -259,20 +345,15 @@ function buildPacket(type, sn, cmdId, payloadBuffer) {
   return Buffer.concat([header, payload]);
 }
 
-// Broadcast packet to all connected clients
-function broadcastPacket(type, sn, cmdId, payloadBuffer) {
+// Broadcast packet only to clients in the specified room
+function broadcastToRoom(roomId, type, sn, cmdId, payloadBuffer) {
   const pkt = buildPacket(type, sn, cmdId, payloadBuffer);
   for (let client of connectedClients.values()) {
-    if (client.ws.readyState === WebSocket.OPEN) {
+    if (client.roomId === roomId && client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(pkt);
     }
   }
 }
-
-// Track active sockets
-const connectedClients = new Map(); // uid -> { ws, uid }
-
-let turnTimer = null;
 
 function chooseBotMove(player, opponent) {
   if (!player || !player.handCards || player.handCards.length === 0) {
@@ -386,51 +467,21 @@ function chooseBotMove(player, opponent) {
   };
 }
 
-function cancelBotForPlayer(uid) {
-  const player = roomState.players.find(p => p.uid === uid);
-  if (!player) return;
-
-  player.isManaged = 0;
-  console.log(`[CANCEL_BOT] Player ${uid} touched screen / cancelled bot!`);
-
-  const onManagedMsg = lobbyProto.pb.OnPlayerSetManaged.create({
-    uid: uid,
-    isManaged: 0
-  });
-  broadcastPacket(2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish()));
-
-  if (roomState.actorId === uid) {
-    if (turnTimer) {
-      clearTimeout(turnTimer);
-      turnTimer = setTimeout(() => {
-        console.log(`[BOT] Player ${uid} süresi doldu (25s)! BOTA BAĞLANDI.`);
-        player.isManaged = 1;
-        const onMsg = lobbyProto.pb.OnPlayerSetManaged.create({
-          uid: uid,
-          isManaged: 1
-        });
-        broadcastPacket(2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onMsg).finish()));
-        executeBotTurn(uid);
-      }, 25000);
-    }
+function setActiveTurn(room, actorId, timeoutSec = 25) {
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
   }
-}
+  if (room.state !== 2) return;
 
-function setActiveTurn(actorId, timeoutSec = 25) {
-  if (turnTimer) {
-    clearTimeout(turnTimer);
-    turnTimer = null;
-  }
-  if (roomState.state !== 2) return;
+  room.actorId = actorId;
 
-  roomState.actorId = actorId;
-
-  const player = roomState.players.find(p => p.uid === actorId);
+  const player = room.players.find(p => p.uid === actorId);
 
   // If this player has 0 cards, switch to next
   if (!player || !player.handCards || player.handCards.length === 0) {
-    console.log(`[TURN] Player ${actorId} has 0 cards.`);
-    switchTurn(actorId);
+    console.log(`[TURN] Room ${room.id} - Player ${actorId} has 0 cards.`);
+    switchTurn(room, actorId);
     return;
   }
 
@@ -440,54 +491,54 @@ function setActiveTurn(actorId, timeoutSec = 25) {
     timeout: timeoutSec
   });
   const actorEnc = gameProto.pb.OnUpdateActor.encode(actorMsg).finish();
-  broadcastPacket(2, 0, 2629, Buffer.from(actorEnc));
-  console.log(`[WS] OnUpdateActor broadcasted: Actor=${actorId}, Timeout=${timeoutSec}s`);
+  broadcastToRoom(room.id, 2, 0, 2629, Buffer.from(actorEnc));
+  console.log(`[WS] Room ${room.id} - OnUpdateActor: Actor=${actorId}, Timeout=${timeoutSec}s`);
 
   const isConnected = connectedClients.has(actorId);
   const isBot = !isConnected || player.isManaged === 1;
 
   if (isBot) {
-    console.log(`[BOT] Player ${actorId} BOT modunda (Bota salınmış / AFK). 1.5s içinde bot oynuyor...`);
-    turnTimer = setTimeout(() => {
-      executeBotTurn(actorId);
+    console.log(`[BOT] Room ${room.id} - Player ${actorId} is BOT. Playing in 1.5s...`);
+    room.turnTimer = setTimeout(() => {
+      executeBotTurn(room, actorId);
     }, 1500);
   } else {
-    console.log(`[HUMAN] Player ${actorId} aktif insan. Tam ${timeoutSec}s bekleniyor...`);
-    turnTimer = setTimeout(() => {
-      console.log(`[BOT] Player ${actorId} süresi doldu (${timeoutSec}s)! BOTA BAĞLANDI.`);
+    console.log(`[HUMAN] Room ${room.id} - Player ${actorId} is HUMAN. Waiting ${timeoutSec}s...`);
+    room.turnTimer = setTimeout(() => {
+      console.log(`[BOT] Room ${room.id} - Player ${actorId} timed out! Enabling bot.`);
       player.isManaged = 1;
       const onManagedMsg = lobbyProto.pb.OnPlayerSetManaged.create({
         uid: actorId,
         isManaged: 1
       });
-      broadcastPacket(2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish()));
-      executeBotTurn(actorId);
+      broadcastToRoom(room.id, 2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish()));
+      executeBotTurn(room, actorId);
     }, timeoutSec * 1000);
   }
 }
 
-function executeBotTurn(actorId) {
-  if (turnTimer) {
-    clearTimeout(turnTimer);
-    turnTimer = null;
+function executeBotTurn(room, actorId) {
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
   }
-  if (roomState.state !== 2) return;
+  if (room.state !== 2) return;
 
-  const player = roomState.players.find(p => p.uid === actorId);
-  const opponent = roomState.players.find(p => p.uid !== actorId);
+  const player = room.players.find(p => p.uid === actorId);
+  const opponent = room.players.find(p => p.uid !== actorId);
 
   if (!player || !player.handCards || player.handCards.length === 0) {
-    switchTurn(actorId);
+    switchTurn(room, actorId);
     return;
   }
 
   const botMove = chooseBotMove(player, opponent);
   if (!botMove) {
-    switchTurn(actorId);
+    switchTurn(room, actorId);
     return;
   }
 
-  console.log(`[BOT] ${actorId} (${player.name}) plays: Card ${botMove.card}, Cmd ${botMove.cmd} (${botMove.reason})`);
+  console.log(`[BOT] Room ${room.id} - ${actorId} (${player.name}) plays: Card ${botMove.card}, Cmd ${botMove.cmd} (${botMove.reason})`);
 
   player.handCards = player.handCards.filter(c => c !== botMove.card);
   player.numOfHandCards = player.handCards.length;
@@ -507,31 +558,31 @@ function executeBotTurn(actorId) {
     numOfHandCards: player.numOfHandCards
   });
   const discardEnc = gameProto.pb.OnPlayerDiscard.encode(onDiscardMsg).finish();
-  broadcastPacket(2, 0, 2627, Buffer.from(discardEnc));
+  broadcastToRoom(room.id, 2, 0, 2627, Buffer.from(discardEnc));
 
-  switchTurn(actorId);
+  switchTurn(room, actorId);
 }
 
-function switchTurn(currentActorId) {
-  if (turnTimer) {
-    clearTimeout(turnTimer);
-    turnTimer = null;
+function switchTurn(room, currentActorId) {
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
   }
-  if (roomState.state !== 2) return;
+  if (room.state !== 2) return;
 
-  const totalCards = roomState.players.reduce((sum, p) => sum + (p.numOfHandCards || 0), 0);
+  const totalCards = room.players.reduce((sum, p) => sum + (p.numOfHandCards || 0), 0);
   if (totalCards === 0) {
-    console.log('[WS] Tüm eller bitti! Yeni tur başlatılıyor...');
+    console.log(`[WS] Room ${room.id} - All hands finished! Dealing new round...`);
     setTimeout(() => {
-      dealNewRound();
+      dealNewRound(room);
     }, 1200);
     return;
   }
 
-  const currentIdx = roomState.players.findIndex(p => p.uid === currentActorId);
+  const currentIdx = room.players.findIndex(p => p.uid === currentActorId);
   let nextActor = null;
-  for (let i = 1; i <= roomState.players.length; i++) {
-    const candidate = roomState.players[(currentIdx + i) % roomState.players.length];
+  for (let i = 1; i <= room.players.length; i++) {
+    const candidate = room.players[(currentIdx + i) % room.players.length];
     if (candidate && candidate.numOfHandCards > 0) {
       nextActor = candidate.uid;
       break;
@@ -541,25 +592,27 @@ function switchTurn(currentActorId) {
   if (!nextActor) nextActor = currentActorId;
 
   setTimeout(() => {
-    setActiveTurn(nextActor, 25);
+    setActiveTurn(room, nextActor, 25);
   }, 800);
 }
 
-function dealNewRound() {
-  if (turnTimer) {
-    clearTimeout(turnTimer);
-    turnTimer = null;
+function dealNewRound(room) {
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
   }
-  if (roomState.state !== 2) return;
+  if (room.state !== 2) return;
 
-  for (let p of roomState.players) {
+  for (let p of room.players) {
     p.handCards = getRandomHand();
     p.numOfHandCards = 4;
   }
+
   for (let client of connectedClients.values()) {
-    const p = roomState.players.find(x => x.uid === client.uid);
+    if (client.roomId !== room.id) continue;
+    const p = room.players.find(x => x.uid === client.uid);
     const dealPayload = gameProto.pb.OnDealCard.create({
-      players: roomState.players.map(pl => ({
+      players: room.players.map(pl => ({
         uid: pl.uid,
         appId: pl.appId || 'gfs',
         userId: pl.userId || pl.uid,
@@ -578,15 +631,16 @@ function dealNewRound() {
     const dealEnc = gameProto.pb.OnDealCard.encode(dealPayload).finish();
     client.ws.send(buildPacket(2, 0, 2628, Buffer.from(dealEnc)));
   }
-  console.log('[WS] Yeni tur kartları dağıtıldı!');
+
+  console.log(`[WS] Room ${room.id} - New round dealt!`);
   setTimeout(() => {
-    setActiveTurn('1001', 25);
+    setActiveTurn(room, room.captain || '1001', 25);
   }, 1200);
 }
 
-function startGameSequence() {
-  roomState.state = 2; // Transition to Gaming!
-  for (let pl of roomState.players) {
+function startGameSequence(room) {
+  room.state = 2; // Transition to Gaming!
+  for (let pl of room.players) {
     pl.pieces = [0, 0, 0, 0];
     pl.isBanned = false;
     if (connectedClients.has(pl.uid)) {
@@ -595,28 +649,28 @@ function startGameSequence() {
         uid: pl.uid,
         isManaged: 0
       });
-      broadcastPacket(2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish()));
+      broadcastToRoom(room.id, 2, 0, 2625, Buffer.from(lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish()));
     }
   }
-  console.log(`[GAME] Starting Game Sequence! Broadcasting to ${connectedClients.size} connected clients...`);
+  console.log(`[GAME] Room ${room.id} - Starting Game Sequence!`);
 
   // Broadcast OnGameReady (cmd 2610)
   const gameReadyMsg = gameProto.pb.OnGameReady.create({
-    players: roomState.players,
+    players: room.players,
     roundId: '1'
   });
   const readyEnc = gameProto.pb.OnGameReady.encode(gameReadyMsg).finish();
-  broadcastPacket(2, 0, 2610, Buffer.from(readyEnc));
+  broadcastToRoom(room.id, 2, 0, 2610, Buffer.from(readyEnc));
 
   // Broadcast OnGameStart (cmd 2611)
   setTimeout(() => {
     const gameStartMsg = gameProto.pb.OnGameStart.create({});
     const startEnc = gameProto.pb.OnGameStart.encode(gameStartMsg).finish();
-    broadcastPacket(2, 0, 2611, Buffer.from(startEnc));
-    console.log(`[WS] Broadcasted OnGameStart to all devices! GameView is now active on PC & Phone!`);
+    broadcastToRoom(room.id, 2, 0, 2611, Buffer.from(startEnc));
+    console.log(`[WS] Room ${room.id} - Broadcasted OnGameStart to all devices! GameView active!`);
 
     setTimeout(() => {
-      dealNewRound();
+      dealNewRound(room);
     }, 1500);
   }, 300);
 }
@@ -626,9 +680,12 @@ wss.on('connection', (ws, req) => {
   const clientUid = urlParams.get('uid') || '1001';
   const clientName = decodeURIComponent(urlParams.get('name') || 'Oyuncu');
   const clientAvatar = decodeURIComponent(urlParams.get('avatar') || '');
-  console.log(`[WS] Client connected: UID=${clientUid}, Name=${clientName}, Avatar=${clientAvatar ? 'yes' : 'no'}`);
+  const roomId = urlParams.get('roomId') || 'room_1';
 
-  connectedClients.set(clientUid, { ws, uid: clientUid, name: clientName, avatar: clientAvatar });
+  console.log(`[WS] Client connected: UID=${clientUid}, Name=${clientName}, Avatar=${clientAvatar ? 'yes' : 'no'}, Room=${roomId}`);
+
+  const clientInfo = { ws, uid: clientUid, name: clientName, avatar: clientAvatar, roomId: roomId };
+  connectedClients.set(clientUid, clientInfo);
 
   ws.on('message', (data) => {
     try {
@@ -641,6 +698,8 @@ wss.on('connection', (ws, req) => {
       const cmdId = buf.readUInt16BE(7);
       const dataLen = buf.readUInt16BE(9);
 
+      const currentRoom = rooms.get(clientInfo.roomId) || getOrCreateRoom(clientInfo.roomId, clientUid, clientName, clientAvatar);
+
       if (cmdId === 101) {
         // Heartbeat
         ws.send(buildPacket(1, sn, 101, Buffer.alloc(0)));
@@ -650,32 +709,12 @@ wss.on('connection', (ws, req) => {
       } else if (cmdId === 2601) {
         // Login (cmd 2601) -> Reply
         ws.send(buildPacket(1, sn, 2601, Buffer.from([0x08, 0x00])));
-        console.log(`[WS] Sent LoginReply to UID: ${clientUid} (${clientName})`);
+        console.log(`[WS] Sent LoginReply to UID: ${clientUid} (${clientName}) in Room: ${currentRoom.id}`);
 
-        // If in Lobby, seat this connecting user as Captain at Seat 0!
-        if (roomState.state === 0) {
-          roomState.captain = clientUid;
-          roomState.actorId = clientUid;
+        // Register or fetch player in room
+        const room = getOrCreateRoom(clientInfo.roomId, clientUid, clientName, clientAvatar);
 
-          const captainPlayer = {
-            uid: clientUid,
-            appId: 'gfs',
-            userId: clientUid,
-            name: clientName,
-            avatar: clientAvatar,
-            gender: '1',
-            seatIndex: 0,
-            state: 1, // Ready (Captain ready)
-            handCards: getRandomHand(),
-            numOfHandCards: 4,
-            pieces: [0, 0, 0, 0]
-          };
-
-          // Room contains ONLY this player at Seat 0; seats 1, 2, 3 are empty!
-          roomState.players = [ captainPlayer ];
-        }
-
-        // Send OnPlayerLogin (cmd 2602)
+        // Send OnPlayerLogin (cmd 2602) containing full room state with all seated players
         setTimeout(() => {
           const onLoginMsg = gameProto.pb.OnPlayerLogin.create({
             account: {
@@ -686,13 +725,13 @@ wss.on('connection', (ws, req) => {
               avatar: clientAvatar,
               gender: '1'
             },
-            game: roomState,
+            game: room,
             serverTime: Date.now()
           });
 
           const encoded = gameProto.pb.OnPlayerLogin.encode(onLoginMsg).finish();
           ws.send(buildPacket(2, 0, 2602, Buffer.from(encoded)));
-          console.log(`[WS] Sent OnPlayerLogin to UID: ${clientUid} (${clientName}) at Seat 0. Players in room: ${roomState.players.length}`);
+          console.log(`[WS] Sent OnPlayerLogin to UID: ${clientUid} (${clientName}) in Room ${room.id}. Total Players: ${room.players.length}`);
         }, 100);
 
       } else if (cmdId === 2607) {
@@ -706,25 +745,25 @@ wss.on('connection', (ws, req) => {
         } catch (e) {
           console.error('[WS] Error decoding ReadyAPI:', e);
         }
-        console.log(`[WS] Player ${clientUid} set isReady to ${isReady}`);
-        const p = roomState.players.find(x => x.uid === clientUid);
+        console.log(`[WS] Player ${clientUid} in Room ${currentRoom.id} set isReady to ${isReady}`);
+        const p = currentRoom.players.find(x => x.uid === clientUid);
         if (p) p.state = isReady === 1 ? 1 : 0;
 
         ws.send(buildPacket(1, sn, 2607, Buffer.from([0x08, 0x00])));
 
-        // Broadcast OnPlayerReady (cmd 2608)
+        // Broadcast OnPlayerReady (cmd 2608) to room
         const readyMsg = lobbyProto.pb.OnPlayerReady.create({
           uid: clientUid,
           isReady: isReady
         });
         const readyEnc = lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish();
-        broadcastPacket(2, 0, 2608, Buffer.from(readyEnc));
+        broadcastToRoom(currentRoom.id, 2, 0, 2608, Buffer.from(readyEnc));
 
       } else if (cmdId === 2609) {
         // Captain clicked Start Game (cmd 2609)!
-        console.log(`[WS] CAPTAIN CLICKED START GAME! Launching Board for ALL players!`);
+        console.log(`[WS] Room ${currentRoom.id} - CAPTAIN CLICKED START GAME!`);
         ws.send(buildPacket(1, sn, 2609, Buffer.from([0x08, 0x00]))); // StartReply
-        startGameSequence();
+        startGameSequence(currentRoom);
 
       } else if (cmdId === 2612) {
         // Loaded (2612)
@@ -739,17 +778,23 @@ wss.on('connection', (ws, req) => {
             if (req.seatIndex !== undefined) kickSeat = req.seatIndex;
           }
         } catch(e) {}
-        console.log(`[WS] Kickout called for seat: ${kickSeat}`);
-        const targetIdx = roomState.players.findIndex(p => p.seatIndex === kickSeat && p.uid !== roomState.captain);
-        if (targetIdx !== -1) {
-          const kicked = roomState.players.splice(targetIdx, 1)[0];
-          ws.send(buildPacket(1, sn, 2614, Buffer.from([0x08, 0x00])));
-          const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
-            uid: kicked.uid,
-            kickUid: clientUid
-          });
-          broadcastPacket(2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
-          console.log(`[WS] Player ${kicked.uid} (${kicked.name}) kicked!`);
+        console.log(`[WS] Room ${currentRoom.id} - Kickout called for seat: ${kickSeat} by UID ${clientUid}`);
+
+        // Only captain can kick
+        if (currentRoom.captain === clientUid) {
+          const targetIdx = currentRoom.players.findIndex(p => p.seatIndex === kickSeat && p.uid !== currentRoom.captain);
+          if (targetIdx !== -1) {
+            const kicked = currentRoom.players.splice(targetIdx, 1)[0];
+            ws.send(buildPacket(1, sn, 2614, Buffer.from([0x08, 0x00])));
+            const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
+              uid: kicked.uid,
+              kickUid: clientUid
+            });
+            broadcastToRoom(currentRoom.id, 2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+            console.log(`[WS] Room ${currentRoom.id} - Player ${kicked.uid} (${kicked.name}) kicked!`);
+          } else {
+            ws.send(buildPacket(1, sn, 2614, Buffer.from([0x08, 0x00])));
+          }
         } else {
           ws.send(buildPacket(1, sn, 2614, Buffer.from([0x08, 0x00])));
         }
@@ -765,8 +810,8 @@ wss.on('connection', (ws, req) => {
         } catch (e) {
           console.error('[WS] Error decoding ChangeSeatAPI:', e);
         }
-        console.log(`[WS] Player ${clientUid} requested change to seat ${newSeat}`);
-        const p = roomState.players.find(x => x.uid === clientUid);
+        console.log(`[WS] Room ${currentRoom.id} - Player ${clientUid} requested change to seat ${newSeat}`);
+        const p = currentRoom.players.find(x => x.uid === clientUid);
         if (p) p.seatIndex = newSeat;
 
         ws.send(buildPacket(1, sn, 2620, Buffer.from([0x08, 0x00])));
@@ -776,13 +821,13 @@ wss.on('connection', (ws, req) => {
           uid: clientUid,
           seatIndex: newSeat
         });
-        broadcastPacket(2, 0, 2621, Buffer.from(lobbyProto.pb.OnPlayerChangeSeat.encode(changeSeatMsg).finish()));
+        broadcastToRoom(currentRoom.id, 2, 0, 2621, Buffer.from(lobbyProto.pb.OnPlayerChangeSeat.encode(changeSeatMsg).finish()));
 
       } else if (cmdId === 2622) {
         // JoinBot (cmd 2622)
-        console.log(`[WS] JoinBot called! Adding bot to empty seat...`);
-        const maxSeats = roomState.modeInfos && roomState.modeInfos[0] ? roomState.modeInfos[0].teamCount[1] : 4;
-        const occupiedSeats = new Set(roomState.players.map(p => p.seatIndex));
+        console.log(`[WS] Room ${currentRoom.id} - JoinBot called! Adding bot to empty seat...`);
+        const maxSeats = currentRoom.modeInfos && currentRoom.modeInfos[0] ? currentRoom.modeInfos[0].teamCount[1] : 4;
+        const occupiedSeats = new Set(currentRoom.players.map(p => p.seatIndex));
         let freeSeat = -1;
         for (let s = 0; s < maxSeats; s++) {
           if (!occupiedSeats.has(s)) {
@@ -806,36 +851,36 @@ wss.on('connection', (ws, req) => {
             handCards: getRandomHand(),
             numOfHandCards: 4
           };
-          roomState.players.push(botPlayer);
+          currentRoom.players.push(botPlayer);
           ws.send(buildPacket(1, sn, 2622, Buffer.from([0x08, 0x00])));
 
           // Broadcast OnPlayerEnter (cmd 2604)
           const enterMsg = lobbyProto.pb.OnPlayerEnter.create({
             player: botPlayer
           });
-          broadcastPacket(2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
+          broadcastToRoom(currentRoom.id, 2, 0, 2604, Buffer.from(lobbyProto.pb.OnPlayerEnter.encode(enterMsg).finish()));
 
           // Broadcast OnPlayerReady (cmd 2608)
           const readyMsg = lobbyProto.pb.OnPlayerReady.create({
             uid: botUid,
             isReady: 1
           });
-          broadcastPacket(2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
-          console.log(`[WS] Bot added to seat ${freeSeat}: ${botPlayer.name}`);
+          broadcastToRoom(currentRoom.id, 2, 0, 2608, Buffer.from(lobbyProto.pb.OnPlayerReady.encode(readyMsg).finish()));
+          console.log(`[WS] Room ${currentRoom.id} - Bot added to seat ${freeSeat}: ${botPlayer.name}`);
         } else {
           ws.send(buildPacket(1, sn, 2622, Buffer.from([0x08, 0x00])));
         }
 
       } else if (cmdId === 2626) {
         // Discard (2626)
-        console.log(`[WS] Player ${clientUid} played a card!`);
+        console.log(`[WS] Room ${currentRoom.id} - Player ${clientUid} played a card!`);
         ws.send(buildPacket(1, sn, 2626, Buffer.from([0x08, 0x00]))); // DiscardReply
 
         try {
           const discardReq = gameProto.pb.DiscardAPI.decode(buf.subarray(11));
           console.log(`[WS] Played card: ${discardReq.card}, cmd: ${discardReq.cmd}, moves:`, discardReq.moves);
 
-          const player = roomState.players.find(p => p.uid === clientUid);
+          const player = currentRoom.players.find(p => p.uid === clientUid);
           if (player) {
             player.isManaged = 0; // Real player played: turn off bot
             player.handCards = player.handCards.filter(c => c !== discardReq.card);
@@ -844,21 +889,22 @@ wss.on('connection', (ws, req) => {
 
           if (discardReq.moves && discardReq.moves.length > 0) {
             for (let m of discardReq.moves) {
-              const targetP = roomState.players.find(p => p.uid === m.uid);
+              const targetP = currentRoom.players.find(p => p.uid === m.uid);
               if (targetP && targetP.pieces && m.index !== undefined && m.pos !== undefined) {
                 targetP.pieces[m.index] = m.pos;
-                console.log(`[WS] Taş konumu güncellendi: UID=${m.uid}, Taş ${m.index} -> Kare ${m.pos}`);
+                console.log(`[WS] Room ${currentRoom.id} - Piece updated: UID=${m.uid}, Index ${m.index} -> Pos ${m.pos}`);
               }
             }
           }
 
           let broadcastMoves = discardReq.moves || [];
           if (discardReq.cmd === 4 && (!broadcastMoves || broadcastMoves.length === 0)) {
-            const targetUid = clientUid === '1001' ? '1002' : '1001';
-            broadcastMoves = [{ uid: targetUid, index: 0, pos: 0 }];
-            const targetPlayer = roomState.players.find(p => p.uid === targetUid);
-            if (targetPlayer) targetPlayer.isBanned = true;
-            console.log(`[WS] Kart 10 (BAN / Pas Geçtir) çalıştı: Oyuncu ${targetUid} banlandı!`);
+            const targetP = currentRoom.players.find(p => p.uid !== clientUid);
+            if (targetP) {
+              broadcastMoves = [{ uid: targetP.uid, index: 0, pos: 0 }];
+              targetP.isBanned = true;
+              console.log(`[WS] Room ${currentRoom.id} - Card 10 (BAN): Player ${targetP.uid} banned!`);
+            }
           }
 
           const onDiscardMsg = gameProto.pb.OnPlayerDiscard.create({
@@ -870,10 +916,9 @@ wss.on('connection', (ws, req) => {
             numOfHandCards: player ? player.numOfHandCards : 0
           });
           const discardEnc = gameProto.pb.OnPlayerDiscard.encode(onDiscardMsg).finish();
-          broadcastPacket(2, 0, 2627, Buffer.from(discardEnc));
-          console.log(`[WS] Broadcasted move to PC and Phone simultaneously!`);
+          broadcastToRoom(currentRoom.id, 2, 0, 2627, Buffer.from(discardEnc));
 
-          switchTurn(clientUid);
+          switchTurn(currentRoom, clientUid);
 
         } catch (e) {
           console.error('[WS] Error processing discard:', e);
@@ -883,28 +928,28 @@ wss.on('connection', (ws, req) => {
         ws.send(buildPacket(1, sn, 2624, Buffer.from([0x08, 0x00]))); // SetManagedReply
         try {
           const managedReq = lobbyProto.pb.SetManagedAPI.decode(buf.subarray(11));
-          const player = roomState.players.find(p => p.uid === clientUid);
+          const player = currentRoom.players.find(p => p.uid === clientUid);
           if (player) {
             player.isManaged = managedReq.isManaged;
           }
-          console.log(`[WS] Player ${clientUid} isManaged set to: ${managedReq.isManaged}`);
+          console.log(`[WS] Room ${currentRoom.id} - Player ${clientUid} isManaged set to: ${managedReq.isManaged}`);
 
           const onManagedMsg = lobbyProto.pb.OnPlayerSetManaged.create({
             uid: clientUid,
             isManaged: managedReq.isManaged
           });
           const enc = lobbyProto.pb.OnPlayerSetManaged.encode(onManagedMsg).finish();
-          broadcastPacket(2, 0, 2625, Buffer.from(enc));
+          broadcastToRoom(currentRoom.id, 2, 0, 2625, Buffer.from(enc));
 
           if (managedReq.isManaged === 0) {
             console.log(`[WS] Bot mode turned OFF for ${clientUid}. Restored 25s countdown.`);
-            if (turnTimer && roomState.actorId === clientUid) {
-              clearTimeout(turnTimer);
-              turnTimer = setTimeout(() => executeBotTurn(clientUid), 25000);
+            if (currentRoom.turnTimer && currentRoom.actorId === clientUid) {
+              clearTimeout(currentRoom.turnTimer);
+              currentRoom.turnTimer = setTimeout(() => executeBotTurn(currentRoom, clientUid), 25000);
             }
-          } else if (managedReq.isManaged === 1 && roomState.actorId === clientUid) {
-            clearTimeout(turnTimer);
-            turnTimer = setTimeout(() => executeBotTurn(clientUid), 1500);
+          } else if (managedReq.isManaged === 1 && currentRoom.actorId === clientUid) {
+            clearTimeout(currentRoom.turnTimer);
+            currentRoom.turnTimer = setTimeout(() => executeBotTurn(currentRoom, clientUid), 1500);
           }
         } catch (e) {
           console.error('[WS] Error processing SetManaged:', e);
@@ -916,13 +961,38 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    console.log(`[WS] Client disconnected: UID=${clientUid}`);
+    console.log(`[WS] Client disconnected: UID=${clientUid}, Room=${roomId}`);
     connectedClients.delete(clientUid);
+
+    const room = rooms.get(roomId);
+    if (room) {
+      // If lobby stage and client was not captain, remove from room and notify
+      if (room.state === 0) {
+        const pIdx = room.players.findIndex(p => p.uid === clientUid && p.uid !== room.captain);
+        if (pIdx !== -1) {
+          room.players.splice(pIdx, 1);
+          const leaveMsg = lobbyProto.pb.OnPlayerLeave.create({
+            uid: clientUid,
+            kickUid: '0'
+          });
+          broadcastToRoom(roomId, 2, 0, 2606, Buffer.from(lobbyProto.pb.OnPlayerLeave.encode(leaveMsg).finish()));
+        }
+      }
+
+      // Check if room is completely empty (no connected sockets in this room)
+      let roomActiveClients = 0;
+      for (let cl of connectedClients.values()) {
+        if (cl.roomId === roomId) roomActiveClients++;
+      }
+      if (roomActiveClients === 0) {
+        console.log(`[ROOM CLEANUP] Room ${roomId} has 0 active clients. Cleaning up room.`);
+        if (room.turnTimer) clearTimeout(room.turnTimer);
+        rooms.delete(roomId);
+      }
+    }
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[JACKAROO GAME SERVER] Ready and listening on port ${PORT}`);
-  console.log(`- PC (Kaptan Türkçe): http://localhost:${PORT}/index.html?test=1&lang=tr&uid=1001`);
-  console.log(`- Phone (Türkçe):     http://192.168.1.40:${PORT}/index.html?test=1&lang=tr&uid=1002`);
+  console.log(`[JACKAROO MULTI-ROOM SERVER] Ready and listening on port ${PORT}`);
 });
