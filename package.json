@@ -1,0 +1,25 @@
+{
+  "name": "jackaroo-game-server",
+  "version": "1.0.0",
+  "description": "Jackaroo Online Multiplayer WebSocket Game Server for TingleCHAT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "jackaroo",
+    "board-game",
+    "websocket",
+    "multiplayer",
+    "tinglechat"
+  ],
+  "author": "TingleCHAT",
+  "license": "ISC"
+}
